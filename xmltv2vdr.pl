@@ -273,7 +273,46 @@ sub ProcessEpg
         $epgText .= "T $1\r\n" if ( $xmlline =~ m:\<title.*?\>(.*?)\</title\>:o );
 
         # XML Program Sub Title
-        $epgText .= "S $1\r\n" if ( $xmlline =~ m:\<sub-title.*?\>(.*?)\</sub-title\>:o );
+        if ( $xmlline =~ m:\<sub-title.*?\>(.*?)\</sub-title\>:o )
+        {
+            $epgText .= "S $1\r\n";
+            $foundsubtitle=1;
+        }
+
+        # XML Episode Number (set as subtitle if none already found)
+        if ( $foundsubtitle == 0 )
+        {
+            if ( $xmlline =~ m:\<episode-num.*?\>([0-9]*).*\.([0-9]*).*\.(.*)\</episode-num\>:o) {
+                $epgText .= "S ";
+                if ( length $1 > 0 ) {
+                    $num = sprintf("%02d", $1);
+                    if ( $num.atoi >= 0 ) {
+                        $num++;
+                        $epgText .= "s$num";
+                        $epgText .= "e";
+                        if (! (length $2 > 0 && $2.atoi >= 0 ) ) {
+                            $epgText .= "00";
+                        }
+                    }
+                }
+                if ( length $2 > 0 ) {
+                    $num = sprintf("%02d", $2);
+                    if ( $num.atoi >= 0 ) {
+                        $num++;
+                        $epgText .= "$num";
+                    }
+                }
+                if ( length $3 > 0 ) {
+                    $num = sprintf("%02d", $2);
+                    if ( $num.atoi >= 0 ) {
+                        $num++;
+                        $epgText .= " part $3";
+                    }
+                }
+                $epgText .= "\r\n";
+                $foundsubtitle=1;
+            }
+        }
 
         # XML Program description at required verbosity
         if ( ( $founddesc == 0 ) && ( $xmlline =~ m/\<desc.*?\>(.*?)\</o ) )
@@ -407,6 +446,7 @@ sub ProcessEpg
             }
             $chanevent=0 ;
             $dc=0 ;
+            $foundsubtitle=0 ;
             $founddesc=0 ;
             $genreinfo=0;
             $foundrating=0;
