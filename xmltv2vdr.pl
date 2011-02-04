@@ -134,7 +134,7 @@ sub SVDRPreceive
         push(@a, $_);
         if (substr($_, 3, 1) ne "-") {
             my $code = substr($_, 0, 3);
-            die("expected SVDRP code $expect, but received $code") if ($code != $expect);
+            warn("expected SVDRP code $expect, but received $code") if ($code != $expect);
             last;
         }
     }
@@ -167,9 +167,9 @@ sub ProcessEpg
 
         my ($channel_name, $freq, $param, $source, $srate, $vpid, $apid, $tpid, $ca, $sid, $nid, $tid, $rid, $xmltv_channel_name) = split(/:/, $chanline);
 
-        if ( $source eq 'T' )
+        if ( $source eq 'A' or $source eq 'T' )
         {
-            $epgfreq=substr($freq, 0, 3);
+            $epgfreq=$freq / 1000;
         }
         else
         {
@@ -191,7 +191,7 @@ sub ProcessEpg
             $chanName{$myChannel} = $channel_name;
 
             # Save the Channel Entry
-            if ($nid>0)
+            if ($tid>0 or $nid>0)
             {
                 $chanId{$myChannel} = "C $source-$nid-$tid-$sid $channel_name\r\n";
             }
@@ -453,6 +453,7 @@ sub ProcessEpg
             $setrating=0;
             $gi=0;
             $creditscomplete = "";
+            $creditdesc = "";
             $description = "";
         }
     }
@@ -481,7 +482,7 @@ Options:
  -r ratings.conf    if xmltv source file contains ratings information then add it
  -l description length  Verbosity of EPG descriptions to use
                         (0-2, 0: more verbose, default: 0)
- -p port                SVDRP port number (default: 2001)
+ -p port                SVDRP port number (default: 6419)
  -s         Simulation Mode (Print info to stdout)
  -t timeout             The time this program has to give all info to
                         VDR (default: 300s)
@@ -496,7 +497,7 @@ $verbose = 1 if $opt_v;
 $sim = 1 if $opt_s;
 $adjust = $opt_a || 0;
 my $Dest   = $opt_d || "localhost";
-my $Port   = $opt_p || 2001;
+my $Port   = $opt_p || 6419;
 my $descv   = $opt_l || 0;
 my $Timeout = $opt_t || 300; # max. seconds to wait for response
 my $xmltvfile = $opt_x  || die "$Usage Need to specify an XMLTV file";
