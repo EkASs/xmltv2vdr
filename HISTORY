@@ -8,7 +8,7 @@ xmltv2vdr Revision History
 2003-04-05: Version 1.0.1
 
 - Clear EPG information before putting in the new info. This stops duplicate
-events showing in the EPG when times are changed for programmes
+  events showing in the EPG when times are changed for programmes
 
 2003-04-07: Version 1.0.2
 
@@ -25,10 +25,13 @@ events showing in the EPG when times are changed for programmes
 2003-05-18: Version 1.0.4
 
 - Problem with options fixed
-- Changes incorporated from Erik Günther ("I did find out that VDR ignores extra  information on a line so adding xmltv-info at the end of the line works fine.   The problem was that xmltv2vdr.pl expected that all lines in input ether 
-  to have a xmltv extention or was not an header line.  I also added an new 
-  option -t for changing the timeout. This was for my machine a P3 600 
-  was to slow and wasn't done in time. So now I can specify -t 600 for 600s)
+- Changes incorporated from Erik GÃ¼nther ("I did find out that VDR ignores
+  extra  information on a line so adding xmltv-info at the end of the line
+  works fine.   The problem was that xmltv2vdr.pl expected that all lines in
+  input ether to have a xmltv extention or was not an header line.  I also
+  added an new option -t for changing the timeout. This was for my machine a
+  P3 600 was to slow and wasn't done in time. So now I can specify -t 600 for
+  600s)
 - Fixed problems with the "expected SVDRP code 250, but received 451 at 
   ./xmltv2vdr.pl line 56" error.
 - Added extra flag, -v to show warning/debug messages
@@ -63,7 +66,16 @@ events showing in the EPG when times are changed for programmes
 
 2010-03-09: Version 1.0.9
 
-- Added Ratings, tidied Genre for NA..  Added ratings, Genre and Credits into description.
+- Added Ratings, tidied Genre for NA..  Added ratings, Genre and Credits into
+  description.
 - Added option to specify ratings.conf and genres.conf
-- Changed the reading of the genre/ratings conf files. Now it realy strips out comment and empty lines :) 
+- Changed the reading of the genre/ratings conf files. Now it realy strips out
+  comment and empty lines :) 
 
+2011-XX-XX: Version 1.1.0
+
+- Add support for XMLTV episode-num.  Currently gets added as EPG entry
+  'sub-title', if no existing subtitle has been found, in the form
+  sXXeXX (e.g., Bones~s01e01). 
+- Change default SVDRP port number to 6419.
+- Better support for ATSC/PVRINPUT EPG sources.
