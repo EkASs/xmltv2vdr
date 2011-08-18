@@ -2,585 +2,578 @@
 
 # xmltv2vdr.pl
 #
-# Converts data from an xmltv output file to VDR - tested with 1.2.6
+# Converts data from an xmltv output file to VDR - tested with 1.7.19
 #
-# The TCP SVDRSend and Receive functions have been used from the getskyepg.pl
-# Plugin for VDR.
+# This script requires:
+#   The PERL module date::manip
+#   The PERL module XML::Parser
+#   xmllint utility (Check the validity of the xmltv file)
 #
-# This script requires: -
-#
-# The PERL module date::manip (required for xmltv anyway)
-#
-# You will also need xmltv installed to get the channel information:
-# http://sourceforge.net/projects/xmltv
+# The files containing genres and ratings MUST be in UTF-8 charset.
+# To convert: iconv --from-code=<source_charset> --to-code=UTF-8 genres.conf > genres.conf.utf8
 #
 # This software is released under the GNU GPL
 #
 # See the README file for copyright information and how to reach the author.
 
-# $Id: xmltv2vdr.pl 1.0.7 2007/04/13 20:01:04 psr Exp $
-
-
-#use strict;
+use strict;
+use utf8;
+use Encode;
 use Getopt::Std;
 use Time::Local;
 use Date::Manip;
+use XML::Parser;
+use Socket;
 
-my $sim=0;
-my $verbose=0;
-my $adjust;
-my @xmllines;
+my $localLang = "fr";
+my $workDir = "/home/marc/epgvdr";
+my $xmltvDtdFile = "file:$workDir/xmltv.dtd";
+my $xmllintBin = "/usr/bin/xmllint";
 
-# Translate HTML/XML encodings into normal characters
-# For some German problems, and also English
-sub xmltvtranslate
-{
+my $Usage = qq{
+Usage: $0 [options] -c <channels.conf file> -x <xmltv datafile> 
+    
+Options:
+ -a (+,-) mins          Adjust the time from xmltv that is fed
+                          into VDR (in minutes) (default: 0)
+ -c channels.conf       File containing modified channels.conf info
+ -d hostname            Destination hostname (default: localhost)
+ -D                     Write debug log
+ -h                     Show help text
+ -g genres.conf         If xmltv source file contains genre information then add it
+ -l description length  Length of the EPG description to use in char
+                          (0: All the description, default: 0)
+ -L credits length      Numbers of EPG credits to keep
+                          (0: All credits, default: 0)
+ -p port                SVDRP port number (default: 6419)
+ -P priority            EPG priority in hex number (if multiple sources) (default: 0)
+ -q                     Quiet mode
+ -r ratings.conf        If xmltv source file contains ratings information then add it
+ -s                     Simulation Mode (Print info to stdout)
+ -t timeout             The time this program has to give all info to VDR
+                          (default: 60s) 
+ -v                     Show info messages
+ -x xmltv output        File containing xmltv data
+ -X                     Add extra attribute to the description
+                          (currently episode-num & star-rating)
+};
+
+# getopts
+our ($opt_a, $opt_c, $opt_d, $opt_D, $opt_h, $opt_g, $opt_l, $opt_L, $opt_p, $opt_P, $opt_q,
+    $opt_r, $opt_s,$opt_t,$opt_v,$opt_x,$opt_X);
+die $Usage if (!getopts('a:c:d:Dg:hl:L:p:qr:st:vx:X') || $opt_h);
+
+# Options
+my $adjust = $opt_a || 0;
+my $channelsFile = $opt_c  || die "$Usage Need to specify a channels.conf file";
+my $dest = $opt_d || "localhost";
+my $debug = $opt_D;
+my $genresFile = $opt_g if $opt_g;
+my $descv = $opt_l || 0;
+if ( $descv < 0 ) { die "$Usage Description lenght out of range"; }
+my $creditsv = $opt_L || 0;
+if ( $creditsv < 0 ) { die "$Usage Credits lenght out of range"; }
+my $port = $opt_p || 6419;
+if ( ( $port < 0 ) || ( $port > 65535 ) ) { die "$Usage Port out of range"; }
+my $epgPrio = $opt_P || 0;
+my $warn = 1 if !($opt_q);
+my $ratingsFile = $opt_r if $opt_r;
+my $sim = $opt_s;
+my $timeout = $opt_t || 60; # max. seconds to wait for response
+if ( $timeout < 0 ) { die "$Usage Timeout out of range"; }
+my $verbose = $opt_v;
+my $xmltvFile = $opt_x  || die "$Usage Need to specify an XMLTV file";
+my $xAttr = $opt_X;
+
+# Logs
+$warn = 1 if $debug;
+$verbose = 1 if $debug;
+if ($debug) {
+    my $debugFile = "$workDir/debug";
+    open(DEBUG, ">$debugFile") || die "$!";
+}
+
+# Files
+$channelsFile = "$workDir/$channelsFile" if ( $channelsFile !~ m:^/: );
+$genresFile = "$workDir/$genresFile" if ( $genresFile !~ m:^/: );
+$ratingsFile = "$workDir/$ratingsFile" if ( $ratingsFile !~ m:^/: );
+$xmltvFile = "$workDir/$xmltvFile" if ( $xmltvFile !~ m:^/: );
+
+# Configuration files data
+my %genreLine;
+my %ratingLine;
+my %channelId;
+my %channelName;
+
+# XML parse
+my %vdrText;
+my $pivotTime = time () - 3600;
+my $isProg = 0;
+my $creditsCount = 0;
+my $programChan = "";
+my $programId = 0;
+my $programStart = 0;
+my $programDur = 0;
+my $programTitle = "";
+my $programShortdesc = "";
+my $programDesc = "";
+my $programDate = "";
+my $currentCreditElement = "";
+my $programCredits = "";
+my $programRole = "";
+my $programGenre = "";
+my $programRating = "";
+my $programStarRating = "";
+my $programEpisode = "";
+my %elementLang = ( element => "", value => "", currentLang => "", newLang => "" );
+
+# Sometime, XML::Parser splits the data
+my $xmlParserBuf = "";
+
+# Translate
+sub translate {
     my $line=shift;
-
-    # German Requests - mail me with updates if some of these are wrong..
-    $line=~s/ und uuml;/ü/g;
-    $line=~s/ und auml;/ä/g;
-    $line=~s/ und ouml;/ö/g;
-    $line=~s/ und quot;/"/g;
-    $line=~s/ und szlig;/ß/g;
-    $line=~s/ und amp;/\&/g;
-    $line=~s/ und middot;/·/g;
-    $line=~s/ und Ouml;/Ö/g;
-    $line=~s/ und Auml;/Ä/g;
-    $line=~s/ und Uuml;/Ü/g ;
-    $line=~s/ und eacute;/é/g;
-    $line=~s/ und aacute;/á/g;
-    $line=~s/ und deg;/°/g;
-    $line=~s/ und ordm;/º/g;
-    $line=~s/ und ecirc;/ê/g;
-    $line=~s/ und ecirc;/ê/g;
-    $line=~s/ und ccedil;/ç/g;
-    $line=~s/ und curren;/€/g;
-    $line=~s/und curren;/€/g;
-    $line=~s/und Ccedil;/Ç/g;
-    $line=~s/ und ocirc;/ô/g;
-    $line=~s/ und egrave;/è/g;
-    $line=~s/ und agrave;/à/g;
-    $line=~s/und quot;/"/g;
-    $line=~s/und Ouml;/Ö/g;
-    $line=~s/und Uuml;/Ü/g;
-    $line=~s/und Auml;/Ä/g;
-    $line=~s/und ouml;/ö/g;
-    $line=~s/und uuml;/ü/g;
-    $line=~s/und auml;/ä/g;
-
-    # English - only ever seen a problem with the Ampersand character..
-    $line=~s/&amp;/&/g;
-
-    # English - found in Radio Times data
-    $line=~s/&#8212;/--/g;
-    $line=~s/&lt;BR \/&gt;/|/g;
+    
+    $line=~s/director/Réalisateur/;
+    $line=~s/actor/Acteur/;
+    $line=~s/writer/Scénariste/;
+    $line=~s/adapter/Adapteur/;
+    $line=~s/producer/Producteur/;
+    $line=~s/presenter/Presentateur/;
+    $line=~s/commentator/Commentateurr/;
+    $line=~s/guest/Invité/;
+    $line=~s/season/Saison/;
+    $line=~s/episode/Episode/;
+    $line=~s/part/Partie/;
+    $line=~s/rating/Note/;
 
     return $line;
 }
 
-# Translate genre text to hex numbers
-sub genre_id {
-    my ($xmlline, $genretxt, $genrenum) = @_;
-    if ( $xmlline =~ m/\<category.*?\>($genretxt)\<\/category\>/)
-    {
-         return "G $genrenum\r\n";
-    }
-}
-
-# Translate ratings text to hex numbers
-sub ratings_id {
-    my ($xmlline, $ratingstxt, $ratingsnum) = @_;
-    if ( $xmlline =~ m/\<value\>($ratingstxt)\<\/value\>/)
-    {
-         return "R $ratingsnum\r\n";
-    }
-}
-
-
 # Convert XMLTV time format (YYYYMMDDmmss ZZZ) into VDR (secs since epoch)
-sub xmltime2vdr
-{
-    my $xmltime=shift;
-    my $secs = &Date::Manip::UnixDate($xmltime, "%s");
+sub xmltime2vdr {
+    my $xmlTime=shift;
+    my $secs = &Date::Manip::UnixDate($xmlTime, "%s");
     return $secs + ( $adjust * 60 );
 }
 
 # Send info over SVDRP (thanks to Sky plugin)
-sub SVDRPsend
-{
+sub SVDRPsend {
     my $s = shift;
-    if ($sim == 0)
-    {
+    print DEBUG "Send : $s\n" if ($debug);
+    if ( $sim == 0 ) {
         print SOCK "$s\r\n";
     }
-    else
-    {
-        print "$s\r\n";
-    }
+    else {
+        print "$s\n";
+    } 
 }
 
 # Recv info over SVDRP (thanks to Sky plugin)
-sub SVDRPreceive
-{
+sub SVDRPreceive {
     my $expect = shift | 0;
-
-    if ($sim == 1)
-    { return 0; }
-
+    
+    if ( $sim == 1 ) { return 0; }
+    
     my @a = ();
     while (<SOCK>) {
         s/\s*$//; # 'chomp' wouldn't work with "\r\n"
         push(@a, $_);
+        print DEBUG "Receive : $_\n" if ($debug);
         if (substr($_, 3, 1) ne "-") {
             my $code = substr($_, 0, 3);
-            warn("expected SVDRP code $expect, but received $code") if ($code != $expect);
+            die("expected SVDRP code $expect, but received $code") if ($code != $expect);
             last;
         }
     }
     return @a;
 }
 
-sub EpgSend
-{
-    my ($p_chanId, $p_chanName, $p_epgText, $p_nbEvent) = @_;
-    # Send VDR PUT EPG
-    SVDRPsend("PUTE");
-    SVDRPreceive(354);
-    SVDRPsend($p_chanId . $p_epgText . "c\r\n" . ".");
-    SVDRPreceive(250);
-    if ($verbose == 1 ) { warn("$p_nbEvent event(s) sent for $p_chanName\n"); }
+# Get data in best language available ( lang=$localLang || no lang || first found )
+sub getLang {
+    my $newValue = shift;
+    
+    print DEBUG "element : *$elementLang{element}* new value : *$newValue* current value : *$elementLang{value}* ",
+        "current lang : *$elementLang{currentLang}* new lang : *$elementLang{newLang}*\n" if $debug;
+
+    if (!$elementLang{value}) {
+        $elementLang{value} = $newValue;
+        $elementLang{currentLang} = $elementLang{newLang};
+        return $newValue;
+    } elsif ( $elementLang{newLang} eq $localLang ) {
+        $elementLang{value} = $newValue;
+        $elementLang{currentLang} = $localLang;
+        return $newValue;
+    } elsif ( (!$elementLang{newLang}) && (!$elementLang{currentLang}) ) {
+        $elementLang{value} = $newValue;
+        return $newValue;
+    }
+    return $elementLang{value};
 }
 
-# Process info from XMLTV file / channels.conf and send via SVDRP to VDR
-sub ProcessEpg
-{
-    my %chanId;
-    my %chanName;
-    my %chanMissing;
-    my $chanline;
-    my $epgfreq;
-    while ( $chanline=<CHANNELS> )
-    {
-        # Split a Chan Line
-        chomp $chanline;
 
-        my ($channel_name, $freq, $param, $source, $srate, $vpid, $apid, $tpid, $ca, $sid, $nid, $tid, $rid, $xmltv_channel_name) = split(/:/, $chanline);
+# Store configuration files data
+sub parse_conf_files {
 
-        if ( $source eq 'A' or $source eq 'T' )
-        {
-            $epgfreq=$freq / 1000;
+    # Genres
+    if ($genresFile) {
+        print "Parsing $genresFile...\n" if $verbose;
+        # Read the genres stuff
+        open(GENRES, "$genresFile") || die "cannot open $genresFile file";
+        while ( <GENRES> ) {
+            s/#.*//;            # ignore comments by erasing them
+            next if /^(\s)*$/;  # skip blank lines
+
+            # Split a Genre Line
+            chomp;
+            my ( $genreName, $genreCode ) = split(/:/, $_);
+            $genreName = decode("UTF-8", $genreName);
+            $genreLine { $genreName } = $genreCode;
+            print DEBUG "Add genre $genreName with code ", $genreLine { $genreName } ,"\n" if $debug;
         }
-        else
-        {
-            $epgfreq=$freq;
-        }
+        print scalar(keys %genreLine) ," genres found.\n" if $verbose;
+        close GENRES;
+    }
 
-        if (!$xmltv_channel_name) {
-            if(!$channel_name) {
-                $chanline =~ m/:(.*$)/;
-                if ($verbose == 1 ) { warn("Ignoring header: $1\n"); }
-            } else {
-                if ($verbose == 1 ) { warn("Ignoring channel: $channel_name, no xmltv info\n"); }
+    # Ratings
+    if ($ratingsFile) {
+        print "Parsing $ratingsFile...\n" if $verbose;
+        # Read the ratings stuff
+        open(RATINGS, "$ratingsFile") || die "cannot open $ratingsFile file";
+        while ( <RATINGS> ) {
+            s/#.*//;            # ignore comments by erasing them
+            next if /^(\s)*$/;  # skip blank lines
+
+            # Split a Rating Line
+            chomp;
+            my ( $ratingName, $ratingAge ) = split(/:/, $_);
+            $ratingName = decode("UTF-8", $ratingName);
+            $ratingLine { $ratingName } = $ratingAge;
+            print DEBUG "Add rating $ratingName with age ", $ratingLine { $ratingName } ,"\n" if $debug;
+        }
+        print scalar(keys %ratingLine) ," ratings found.\n" if $verbose;
+        close RATINGS;
+    }
+
+    # Channels
+    print "Parsing $channelsFile...\n" if $verbose;
+    open(CHANNELS, "$channelsFile") || die "cannot open $channelsFile file";
+    my $verboseMsg = "Channels with no xmltv info :" if ($verbose);
+    my $count = 0;
+    while ( <CHANNELS> ) {
+        s/#.*//;            # ignore comments by erasing them
+        next if /^(\s)*$/;  # skip blank lines
+
+        # Split a Channel Line
+        chomp;
+        my ($channelName, $freq, $param, $source, $srate, $vpid, $apid, $tpid, $ca, $sid, $nid,
+            $tid, $rid, $xmltvChannelName) = split(/:/, $_);
+        
+        if ( $source eq 'T' ) { 
+            $freq=substr($freq, 0, 3);
+        }
+        
+        if (!$xmltvChannelName) {
+            if(!$channelName) {
+                $_ =~ m/:(.*$)/;
+                if ($warn == 1 ) { warn("\nIgnoring header: $1\n"); }
+            }
+            else {
+                $verboseMsg .= " $channelName," if $verbose;
+                $count++;
             }
             next;
         }
-        my @channels = split ( /,/, $xmltv_channel_name);
-        foreach my $myChannel ( @channels )
-        {
-            $chanName{$myChannel} = $channel_name;
-
+        my @channels = split ( /,/, $xmltvChannelName);
+        foreach my $myChannel ( @channels ) {
+            $channelName{$myChannel} = $channelName;
             # Save the Channel Entry
-            if ($tid>0 or $nid>0)
-            {
-                $chanId{$myChannel} = "C $source-$nid-$tid-$sid $channel_name\r\n";
+            if ($nid>0) {
+                $channelId{$myChannel} = "C $source-$nid-$tid-$sid $channelName\r\n";
             }
-            else
-            {
-                $chanId{$myChannel} = "C $source-$nid-$epgfreq-$sid $channel_name\r\n";
+            else {
+                $channelId{$myChannel} = "C $source-$nid-$freq-$sid $channelName\r\n";
             }
+            print DEBUG "Add channel $myChannel : $channelId{$myChannel}" if $debug;
+            $vdrText{$myChannel} = "";
         }
     }
+    print scalar(keys %channelId) ," channels found.\n" if $verbose;
+    print "$verboseMsg * Total : $count *.\n" if $verbose;
+}
 
-    # Set XML parsing variables
-    my $chanevent = 0;
-    my $dc = 0;
-    my $founddesc=0;
-    my $foundcredits=0;
-    my $creditscomplete=0;
-    my $description = "";
-    my $creditdesc = "";
-    my $foundrating=0;
-    my $setrating=0;
-    my $genreinfo=0;
-    my $gi = 0;
-    my $chanCur = "";
-    my $nbEventSent = 0;
-    my $atLeastOneEpg = 0;
-    my $epgText = "";
-    my $pivotTime = time ();
-    my $xmlline;
+#
+# XML::Parser handlers
+#
 
-    # Find XML events
-    foreach $xmlline (@xmllines)
-    {
-        chomp $xmlline;
-        $xmlline=xmltvtranslate($xmlline);
+# process a XML::Parser default event
+sub handle_def { }
 
-        # New XML Program - doesn't handle split programs yet
-        if ( ($xmlline =~ /\<programme/o ) && ( $xmlline !~ /clumpidx=\"1\/2\"/o ) && ( $chanevent == 0 ) )
-        {
-            my ( $chan ) = ( $xmlline =~ m/channel\=\"(.*?)\"/ );
-            if ( !exists ($chanId{$chan}) )
-            {
-                if ( !exists ($chanMissing{$chan}) )
-                {
-                    if ($verbose == 1 ) { warn("$chan unknown in channels.conf\n"); }
-                    $chanMissing{$chan} = 1;
-                }
-                next;
-            }
-            my ( $xmlst, $xmlet ) = ( $xmlline =~ m/start\=\"(.*?)\"\s+stop\=\"(.*?)\"/o );
-            my $vdrst = &xmltime2vdr($xmlst);
-            my $vdret = &xmltime2vdr($xmlet);
-            if ($vdret < $pivotTime)
-            {
-                next;
-            }
-            if ( ( $chanCur ne "" ) && ( $chanCur ne $chan ) )
-            {
-                $atLeastOneEpg = 1;
-                EpgSend ($chanId{$chanCur}, $chanName{$chanCur}, $epgText, $nbEventSent);
-                $epgText = "";
-                $nbEventSent = 0;
-            }
-            $chanCur = $chan;
-            $nbEventSent++;
-            $chanevent = 1;
-            my $vdrdur = $vdret - $vdrst;
-            my $vdrid = $vdrst / 60 % 0xFFFF;
-
-            # Send VDR Event
-            $epgText .= "E $vdrid $vdrst $vdrdur 0\r\n";
-        }
-
-        if ( $chanevent == 0 )
-        {
-            next;
-        }
-
-        # XML Program Title
-        $epgText .= "T $1\r\n" if ( $xmlline =~ m:\<title.*?\>(.*?)\</title\>:o );
-
-        # XML Program Sub Title
-        if ( $xmlline =~ m:\<sub-title.*?\>(.*?)\</sub-title\>:o )
-        {
-            $epgText .= "S $1\r\n";
-            $foundsubtitle=1;
-        }
-
-        # XML Episode Number (set as subtitle if none already found)
-        if ( $foundsubtitle == 0 )
-        {
-            if ( $xmlline =~ m:\<episode-num.*?\>([0-9]*).*\.([0-9]*).*\.(.*)\</episode-num\>:o) {
-                $epgText .= "S ";
-                if ( length $1 > 0 ) {
-                    $num = sprintf("%02d", $1);
-                    if ( $num.atoi >= 0 ) {
-                        $num++;
-                        $epgText .= "s$num";
-                        $epgText .= "e";
-                        if (! (length $2 > 0 && $2.atoi >= 0 ) ) {
-                            $epgText .= "00";
-                        }
-                    }
-                }
-                if ( length $2 > 0 ) {
-                    $num = sprintf("%02d", $2);
-                    if ( $num.atoi >= 0 ) {
-                        $num++;
-                        $epgText .= "$num";
-                    }
-                }
-                if ( length $3 > 0 ) {
-                    $num = sprintf("%02d", $2);
-                    if ( $num.atoi >= 0 ) {
-                        $num++;
-                        $epgText .= " part $3";
-                    }
-                }
-                $epgText .= "\r\n";
-                $foundsubtitle=1;
-            }
-        }
-
-        # XML Program description at required verbosity
-        if ( ( $founddesc == 0 ) && ( $xmlline =~ m/\<desc.*?\>(.*?)\</o ) )
-        {
-            if ( $descv == $dc )
-            {
-                # Send VDR Description & end of event
-                $description .= "$1|";
-                $founddesc=1;
-            }
-            else
-            {
-                # Description is not required verbosity
-                $dc++;
-            }
-        }
-        if ( ( $foundcredits == 0 ) && ( $xmlline =~ m/\<credits\>/o ) )
-        {
-            $foundcredits=1;
-            $creditdesc="";
-        }
-
-        if ( ( $foundcredits == 1 ) && ( $xmlline =~ m:\<.*?\>(.*?)\<:o ) )
-        {
-            my $desc;
-            my $type;
-            $desc = $1;
-            $temp = "";
-            if ( $xmlline =~ m:\<(.*?)\>:o )
-            {
-                $type = ucfirst $1;
-            }
-            $creditdesc .= "$type $desc|";
-        }
-        if ( ( $foundcredits== 1) && ( $xmlline =~ m/\<\/credits\>/o ) )
-        {
-            $foundcredits = 0;
-            $creditscomplete = 1;
-        }
-        if ( ( $foundrating == 0 ) && ( $xmlline =~ m:\<rating.*?\=(.*?)\>:o ) )
-        {
-            $foundrating=1;
-        }
-        if ( ( $foundrating == 1 ) && ( $ratings == 0 ) && ( $xmlline =~ m:\<value.*?\>(.*?)\<:o ) )
-        {
-            if ( $setrating == 0 )
-            {
-                my $ratingstxt;
-                my $ratingsnum;
-                my $ratingsline;
-                my $tmp;
-                foreach my $ratingsline ( @ratinglines )
-                {
-                    my ($ratingstxt, $ratingsnum) = split(/:/, $ratingsline);
-                    $tmp=ratings_id($xmlline, $ratingstxt, $ratingsnum);
-                    if ($tmp)
-                    {
-                        last; # break out of the while loop
-                    }
-
-                }
-                if ($tmp) {
-                    $epgText .=$tmp;
-                    $setrating=1;
-                    $description .= "$1|";
-                }
-            }
-        }
-        if ( $genre == 0 )
-        {
-            if ( ( $genreinfo == 0 ) && ( $xmlline =~ m:\<category.*?\>(.*?)\</category\>:o ) )
-            {
-                if ( $genre == $gi )
-                {
-                    my $genretxt;
-                    my $genrenum;
-                    my $genreline;
-                    my $tmp;
-                    foreach my $genreline ( @genlines )
-                    {
-                        my ($genretxt, $genrenum) = split(/:/, $genreline);
-                        $tmp=genre_id($xmlline, $genretxt, $genrenum);
-                        if ($tmp)
-                        {
-                            last; # break out of the while loop
-                        }
-                    }
-                    if ($tmp) {
-                        $epgText .=$tmp;
-                        $description .= "$genretxt|";
-                        $gi++;
-                        $genreinfo=1;
-                    }
-                }
-                else
-                {
-                    # No genre information asked
-                    $genre++;
-                }
-            }
-        }
-        else
-        {
-            $genreinfo=1;
-        }
-
-        # No Description and or Genre found
-        if (( $xmlline =~ /\<\/programme/o ))
-        {
-            if (( $founddesc == 0 ) || ( $genreinfo == 0 ))
-            {
-                if (( $founddesc == 0 ) && ( $genreinfo == 0 )) {
-                    $epgText .= "D Info Not Available\r\n";
-                    $epgText .= "G 0\r\n";
-                    $epgText .= "e\r\n";
-                }
-                if  (( $founddesc == 0 ) && ( $genreinfo == 1 )) {
-                    $epgText .= "D Info Not Available\r\n";
-                    $epgText .= "e\r\n";
-                }
-                if  (( $founddesc == 1 ) && ( $genreinfo == 0 )) {
-                    $epgText .= "D $description$creditdesc\r\n";
-                    $epgText .= "G 0\r\n";
-                    $epgText .= "e\r\n";
-                }
-            }
-            else
-            {
-                $epgText .= "D $description$creditdesc\r\n";
-                $epgText .= "e\r\n";
-            }
-            $chanevent=0 ;
-            $dc=0 ;
-            $foundsubtitle=0 ;
-            $founddesc=0 ;
-            $genreinfo=0;
-            $foundrating=0;
-            $setrating=0;
-            $gi=0;
-            $creditscomplete = "";
-            $creditdesc = "";
-            $description = "";
+# process a XML::Parser start-of-element event
+sub handle_start {
+    my ( $expat, $element, %attrs ) = @_;
+ 
+    print DEBUG "<$element>\n" if $debug;
+    if ( %attrs && $debug ) {
+        print DEBUG "Attributes:\n";
+        while( my( $key, $value ) = each( %attrs )) {
+            print DEBUG "\t$key => $value\n";
         }
     }
+    
+    $xmlParserBuf = "";
 
-    if ( $atLeastOneEpg )
-    {
-        EpgSend ($chanId{$chanCur}, $chanName{$chanCur}, $epgText, $nbEventSent);
+    # New XML Program
+    if ( $element eq "programme" ) {
+        print DEBUG "Found programme\n" if $debug;
+        # doesn't handle split programs yet (clumpidx)
+        if ( $attrs{clumpidx} ) {
+            warn "Found splitted programme for $channelName{$attrs{channel}}\n" if $warn;
+            print DEBUG "Programme splitted, abort\n" if $debug;
+            return 0;
+        }
+        $programStart = &xmltime2vdr( $attrs{start} );
+        $programId = $programStart / 60 % 0xFFFF;
+        my $vdrStop = &xmltime2vdr( $attrs{stop} );
+        if ($vdrStop < $pivotTime) {
+            warn "Found outdated programme for $channelName{$attrs{channel}}\n" if $warn;
+            print DEBUG "Programme outdated, abort\n" if $debug;
+            return 0;
+        }
+        $programDur = $vdrStop - $programStart;
+        $programChan = $attrs{channel};
+        $isProg = 1;
+    # Existing Program
+    } elsif ($isProg) {
+        if ( $elementLang{element} ne $element ) {
+            # New element
+            %elementLang = ( element => $element, value => "", currentLang => "", newLang => "" );
+        }
+        # Get attributes when needed
+        $elementLang{newLang} = "$attrs{lang}";
+        if ( $element eq "actor" ) {
+            $programRole = "$attrs{role}";
+        } elsif ( ( $xAttr ) && ( $element eq "episode-num" ) && ( $attrs{system} ) ) {
+            $programEpisode = $attrs{system};
+        # Get value when needed
+        } elsif ( ( $xAttr ) && ( $element eq "star-rating" ) ) {
+            $programStarRating = "*nextvalue*";
+        }
     }
 }
+ 
+# process a XML::Parser chars-of-element event
+sub handle_char {
+    my ($expat, $str) = @_;
+    
+    $xmlParserBuf .= $str;
 
-#---------------------------------------------------------------------------
-# main
+    if ($debug) {
+        ( $str =~ s:^[\s\n\r\t]*:: );
+        print DEBUG "String:\n\t$str\n" if $str;
+    }
 
-use Socket;
-
-my $Usage = qq{
-Usage: $0 [options] -c <channels.conf file> -x <xmltv datafile>
-
-Options:
- -a (+,-) mins      Adjust the time from xmltv that is fed
-                        into VDR (in minutes) (default: 0)
- -c channels.conf   File containing modified channels.conf info
- -d hostname            destination hostname (default: localhost)
- -h         Show help text
- -g genre.conf      if xmltv source file contains genre information then add it
- -r ratings.conf    if xmltv source file contains ratings information then add it
- -l description length  Verbosity of EPG descriptions to use
-                        (0-2, 0: more verbose, default: 0)
- -p port                SVDRP port number (default: 6419)
- -s         Simulation Mode (Print info to stdout)
- -t timeout             The time this program has to give all info to
-                        VDR (default: 300s)
- -v                 Show warning messages
- -x xmltv output    File containing xmltv data
-
-};
-
-die $Usage if (!getopts('a:d:p:l:g:r:t:x:c:vhs') || $opt_h);
-
-$verbose = 1 if $opt_v;
-$sim = 1 if $opt_s;
-$adjust = $opt_a || 0;
-my $Dest   = $opt_d || "localhost";
-my $Port   = $opt_p || 6419;
-my $descv   = $opt_l || 0;
-my $Timeout = $opt_t || 300; # max. seconds to wait for response
-my $xmltvfile = $opt_x  || die "$Usage Need to specify an XMLTV file";
-my $channelsfile = $opt_c  || die "$Usage Need to specify a channels.conf file";
-$genfile = $opt_g if $opt_g;
-$ratingsfile = $opt_r if $opt_r;
-
-# Check description value
-if ($genfile) {
-$genre=0;
-my @genrelines;
-# Read the genres.conf stuff into memory - quicker parsing
-open(GENRE, "$genfile") || die "cannot open genres.conf file";
-while ( <GENRE> ) {
-    s/#.*//;            # ignore comments by erasing them
-    next if /^(\s)*$/;  # skip blank lines
-    chomp;
-    push @genlines, $_;
-}
-close GENRE;
-}
-else {
-$genre=1;
 }
 
-if ($ratingsfile) {
-$ratings=0;
-my @ratinglines;
-# Read the genres.conf stuff into memory - quicker parsing
-open(RATINGS, "$ratingsfile") || die "cannot open genres.conf file";
-while ( <RATINGS> ) {
-    s/#.*//;            # ignore comments by erasing them
-    next if /^(\s)*$/;  # skip blank lines
-    chomp;
-    push @ratinglines, $_;
-}
-close RATINGS;
-}
-else {
-$ratings=1;
+# process an XML::Parser end-of-element event
+sub handle_end {
+    my( $expat, $element ) = @_;
+
+    print DEBUG "</$element>\n" if $debug;
+    print DEBUG "xmlParserBuf : $xmlParserBuf\n" if $debug;
+
+    # elements
+    if ($isProg) {
+        if ( $element eq "title" ) {
+            my $value = getLang ( $xmlParserBuf );
+            $programTitle = $value;
+        } elsif ( $element eq "sub-title" ) {
+            my $value = getLang ( $xmlParserBuf );
+            $programShortdesc = $value;
+        } elsif ( $element eq "desc" ) {
+            my $value = getLang ( $xmlParserBuf );
+            $programDesc = $value;
+            $programDesc = substr($programDesc, 0, $descv) if ($descv);
+        } elsif ( $element eq "date" ) {
+            $programDate = "( $xmlParserBuf )";
+        } elsif ( $element =~ m/^(director|actor|writer|adapter|producer|presenter|commentator|guest)$/ ) {
+            if ( !($creditsv) || ( $creditsCount < $creditsv ) ) {
+                if ( $currentCreditElement eq $element ) {
+                    $programCredits .=  ", $xmlParserBuf";
+                    $programCredits .=  " \"$programRole\"" if $programRole;
+                } else {
+                    $currentCreditElement = $element;
+                    $programCredits .= ".|" if $creditsCount;
+                    $programCredits .= translate($element);
+                    $programCredits .=  " : $xmlParserBuf";
+                    $programCredits .=  " \"$programRole\"" if $programRole;
+                }
+                $creditsCount++;
+            }
+            $programRole = "";
+        } elsif ( $element eq "category" ) {
+            my $value = getLang ( $xmlParserBuf );
+            if ($genreLine { $value }) {
+                $programGenre = $genreLine { $value };
+            } else {
+                warn "Genre unknown : $value\n" if $warn;
+                print DEBUG "Genre unknown : $value\n" if $debug;
+            }
+        } elsif ( $element eq "rating" ) {
+            if ($ratingLine { $xmlParserBuf }) {
+                $programRating .= $ratingLine { $xmlParserBuf };
+            } else {
+                warn "Rating unknown : $xmlParserBuf\n" if $warn;
+                print DEBUG "Rating unknown : $xmlParserBuf\n" if $debug;
+            }
+        } elsif ( $element eq "episode-num" ) {
+            if ( $programEpisode eq "xmltv_ns" ) {
+                $programEpisode = "";
+                my ($season, $episode, $part) = split(/\./, $xmlParserBuf);
+                my ($number, $total) = split(/\//, $season);
+                if ($number) {
+                    $number++;
+                    $programEpisode .= translate("season"). " $number";
+                    $programEpisode .= "/$total" if $total;
+                    print DEBUG "Season : $programEpisode\n" if $debug;
+                }
+                my ($number, $total) = split(/\//, $episode);
+                if ($number) {
+                    $number++;
+                    $programEpisode .= " - " if ($season);
+                    $programEpisode .= translate("episode"). " $number";
+                    $programEpisode .= "/$total" if $total;
+                    print DEBUG "Episode : $programEpisode\n" if $debug;
+                }
+                my ($number, $total) = split(/\//, $part);
+                if ($number) {
+                    $number++;
+                    $programEpisode .= " - " if ($season || $episode);
+                    $programEpisode .= translate("part"). " $number";
+                    $programEpisode .= "/$total" if $total;
+                    print DEBUG "Part : $programEpisode\n" if $debug;
+                }
+            } else {
+                $programEpisode = translate("episode"). " $xmlParserBuf";
+                print DEBUG "Raw : $programEpisode\n" if $debug;
+            }
+            $programEpisode .= " ";
+        } elsif ( ( $element eq "value" ) && ( $programStarRating eq "*nextvalue*" ) ) {
+            $programStarRating = translate("rating") . " : $xmlParserBuf";
+        # Completed XML Program
+        } elsif ( $element eq "programme" ) {
+            # Infos
+            my $epgEntry = "E $programId $programStart $programDur $epgPrio\r\n";
+            # Title
+            $epgEntry .= "T $programTitle\r\n" if ( $programTitle );
+            # Short text
+            $epgEntry .= "S $programShortdesc\r\n" if ( $programShortdesc );
+            # description
+            $programEpisode = "$programEpisode$programDate|" if ( $programEpisode || $programDate );
+            $programDesc = "$programDesc|" if ( $programDesc );
+            $programCredits = "$programCredits." if ( $programCredits );
+            $programCredits = "$programCredits|" if ( $programCredits && $programStarRating );
+            $epgEntry .= "D $programEpisode$programDesc$programCredits$programStarRating\r\n"
+                if (  $programEpisode || $programDesc || $programCredits || $programStarRating);
+            # genre
+            $programGenre = "FF" if !( $programGenre );
+            $epgEntry .= "G $programGenre\r\n";
+            # end
+            $epgEntry .= "e\r\n";
+            
+            $vdrText{$programChan} .= $epgEntry;
+            print DEBUG "Add  programme :\n$epgEntry" if $debug;
+            
+            $isProg = 0;
+            $creditsCount = 0;
+            $programChan = "";
+            $programId = 0;
+            $programStart = 0;
+            $programDur = 0;
+            $programTitle = "";
+            $programShortdesc = "";
+            $programDesc = "";
+            $programDate = "";
+            $currentCreditElement = "";
+            $programCredits = "";
+            $programGenre = "";
+            $programRating = "";
+            $programEpisode = "";
+            $programStarRating = "";
+        }
+    }
+    $xmlParserBuf = "";
 }
 
+#
+# Main
+#
 
-if ( ( $descv < 0 ) || ( $descv > 2 ) )
-{
-    die "$Usage Description out of range. Try 0 - 2";
-}
+# parse configuration files
+parse_conf_files;
 
-# Read all the XMLTV stuff into memory - quicker parsing
-open(XMLTV, "$xmltvfile") || die "cannot open xmltv file";
-@xmllines=<XMLTV>;
-close(XMLTV);
+# check xml file
+print "Checking $xmltvFile...\n" if $verbose;
+system( $xmllintBin, "--valid", "--dtdvalid", "$xmltvDtdFile", "--noout", $xmltvFile ) == 0 || die "Check failed\n";
 
-# Now open the VDR channel file
-open(CHANNELS, "$channelsfile") || die "cannot open channels.conf file";
+# initialize the parser
+my $parser = XML::Parser->new(
+    Handlers => {
+        Start => \&handle_start,
+        End => \&handle_end,
+        Char => \&handle_char,
+        Default => \&handle_def,
+    }
+);
+
+# Do the EPG stuff
+print "Parsing $xmltvFile...\n" if $verbose;
+$parser->parsefile( $xmltvFile );
 
 # Connect to SVDRP socket (thanks to Sky plugin coders)
-if ( $sim == 0 )
-{
+if ( $sim == 0 ) {
     $SIG{ALRM} = sub { die("timeout"); };
-    alarm($Timeout);
-
-    my $iaddr = inet_aton($Dest)                   || die("no host: $Dest");
-    my $paddr = sockaddr_in($Port, $iaddr);
-
+    alarm($timeout);
+    
+    my $iAddr = inet_aton($dest) || die("no host: $dest");
+    my $pAddr = sockaddr_in($port, $iAddr);
+    
     my $proto = getprotobyname('tcp');
     socket(SOCK, PF_INET, SOCK_STREAM, $proto)  || die("socket: $!");
-    connect(SOCK, $paddr)                       || die("connect: $!");
+    connect(SOCK, $pAddr)                       || die("connect: $!");
     select((select(SOCK), $| = 1)[0]);
 }
+
+print "Sending data...\n" if $verbose;
 
 # Look for initial banner
 SVDRPreceive(220);
 SVDRPsend("CLRE");
 SVDRPreceive(250);
 
-# Do the EPG stuff
-ProcessEpg();
+# Send the data
+while ( my ($key, $value) = each(%vdrText) ) {
+    if ($value) {
+        print "Send $key => $channelName{$key}\n" if $verbose;
+        # Send VDR PUT EPG
+        SVDRPsend("PUTE");
+        SVDRPreceive(354);
+        my $vdrEncoded = encode("UTF-8", $value);
+        SVDRPsend($channelId{$key} . $vdrEncoded . "c\r\n" . ".");
+        SVDRPreceive(250);
+        print DEBUG "$channelId{$key}$value" if $debug;
+    } else {
+        print "No data for $key ($channelName{$key})\n" if $verbose;
+    }
+}
 
 # Lets get out of here! :-)
 SVDRPsend("QUIT");
 SVDRPreceive(221);
 
-close(SOCK);
+close(SOCK) if ( $sim == 0 );
+close(DEBUG) if $debug;
 
- # vim: set sw=4 et ts=8 :
+print "All done.\n" if $verbose;
+
+exit;
