@@ -125,6 +125,7 @@ my $programGenre = "";
 my $programRating = "";
 my $programStarRating = "";
 my $programEpisode = "";
+my $programEpisodeShort = "";
 my %elementLang = ( element => "", value => "", currentLang => "", newLang => "" );
 
 # Sometime, XML::Parser splits the data
@@ -429,11 +430,13 @@ sub handle_end {
         } elsif ( $element eq "episode-num" ) {
             if ( $programEpisode eq "xmltv_ns" ) {
                 $programEpisode = "";
+                $programEpisodeShort = "";
                 my ($season, $episode, $part) = split(/\./, $xmlParserBuf);
                 my ($number, $total) = split(/\//, $season);
                 if ($number) {
                     $number++;
                     $programEpisode .= translate("season"). " $number";
+                    $programEpisodeShort .= "s" .sprintf("%02d", $number);;
                     $programEpisode .= "/$total" if $total;
                     print DEBUG "Season : $programEpisode\n" if $debug;
                 }
@@ -442,6 +445,7 @@ sub handle_end {
                     $number++;
                     $programEpisode .= " - " if ($season);
                     $programEpisode .= translate("episode"). " $number";
+                    $programEpisodeShort .= "e" .sprintf("%02d", $number);;
                     $programEpisode .= "/$total" if $total;
                     print DEBUG "Episode : $programEpisode\n" if $debug;
                 }
@@ -467,7 +471,12 @@ sub handle_end {
             # Title
             $epgEntry .= "T $programTitle\r\n" if ( $programTitle );
             # Short text
-            $epgEntry .= "S $programShortdesc\r\n" if ( $programShortdesc );
+            if ( !$programShortdesc ) {
+                $programShortdesc .= $programEpisodeShort;
+                $epgEntry .= "S $programShortdesc\r\n";
+                $programEpisode = "";
+            }
+            
             # description
             $programEpisode = "$programEpisode$programDate|" if ( $programEpisode || $programDate );
             $programDesc = "$programDesc|" if ( $programDesc );
@@ -499,6 +508,7 @@ sub handle_end {
             $programGenre = "";
             $programRating = "";
             $programEpisode = "";
+            $programEpisodeShort = "";
             $programStarRating = "";
         }
     }
