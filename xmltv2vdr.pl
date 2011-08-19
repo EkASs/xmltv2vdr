@@ -472,11 +472,10 @@ sub handle_end {
             $epgEntry .= "T $programTitle\r\n" if ( $programTitle );
             # Short text
             if ( !$programShortdesc ) {
-                $programShortdesc .= $programEpisodeShort;
-                $epgEntry .= "S $programShortdesc\r\n";
+                $programShortdesc = $programEpisodeShort;
                 $programEpisode = "";
             }
-            
+            $epgEntry .= "S $programShortdesc\r\n" if ( $programShortdesc );
             # description
             $programEpisode = "$programEpisode$programDate|" if ( $programEpisode || $programDate );
             $programDesc = "$programDesc|" if ( $programDesc );
